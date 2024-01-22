@@ -20,6 +20,7 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
+import matplotlib.pyplot as plt
 
 # 设置为False跳过Note执行(例如调试)
 warnings.filterwarnings("ignore")
@@ -132,3 +133,134 @@ class LayerNorm(nn.Module):
         mean = x.mean(-1, keepdim=True)
         std = x.std(-1, keepdim=True)
         return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
+
+
+# 残差连接
+class SublayerConnection(nn.Module):
+    """
+    SublayerConnection 紧跟在层归一化后的残差连接
+    """
+
+    def __init__(self, size, dropout):
+        super().__init__()
+        self.norm = LayerNorm(size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, sublayer):
+        """
+        将残差层应用在所有大小相同的层
+        """
+        return x + self.dropout(sublayer(self.norm(x)))
+
+
+class EncoderLayer(nn.Module):
+    """
+    EncoderLayer Encoder的一层，包含自注意力和前馈网络
+    """
+
+    def __init__(self, size, self_attn, feed_forward, dropout):
+        super().__init__()
+        self.self_attn = self_attn
+        self.feed_forward = feed_forward
+        self.sublayer = clones(SublayerConnection(size, dropout), 2)
+        self.size = size
+
+    def forward(self, x, mask):
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
+        return self.sublayer[1](x, self.feed_forward)
+
+
+class Decoder(nn.Module):
+    """
+    Decoder 带掩码的通用解码器
+    """
+
+    def __init__(self, layer, N):
+        super().__init__()
+        self.layers = clones(layer, N)
+        self.norm = LayerNorm(layer.size)
+
+    def forward(self, x, memory, src_mask, tgt_mask):
+        for layer in self.layers:
+            x = layer(x, memory, src_mask, tgt_mask)
+        return self.norm(x)
+
+
+class DecoderLayer(nn.Module):
+    """
+    DecoderLayer 解码器的一层，包含自注意力，源注意力和前馈网络
+    """
+
+    def __init__(self, size, self_attn, src_attn, feed_forward, dropout):
+        super().__init__()
+        self.size = size
+        self.self_attn = self_attn
+        self.src_attn = src_attn
+        self.feed_forward = feed_forward
+        self.sublayer = clones(SublayerConnection(size, dropout), 3)
+
+    def forward(self, x, memory, src_mask, tgt_mask):
+        """
+        forward 依次传入每一层
+        """
+        m = memory
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
+        # 解码器的第二个attn的k,v是编码器提供的输出，用编码器的x去查解码器的attn输出
+        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
+        return self.sublayer[2](x, self.feed_forward)
+
+
+def subsequent_mask(size):
+    """
+    subsequent_mask 屏蔽后面的位置
+    """
+
+    attn_shape = (1, size, size)
+    # torch.triu() 接收一个上二维张量作为输入，返回一个上三角矩阵，
+    # diagonal = 1 表示从主对角线以上的元素开始填充，0 表示其他元素，返回一个 0/1 的矩阵
+    subsequent_mask = torch.triu(torch.ones(attn_shape),
+                                 diagonal=1).type(torch.uint8)
+    # 下三角矩阵，对角线以下的元素为1（True），其他元素为0
+    # 可以屏蔽后面的位置
+    return subsequent_mask == 0
+
+
+# 遮罩示意
+def example_mask():
+    LS_data = pd.concat([
+        pd.DataFrame({
+            "Subsequent Mask": subsequent_mask(20)[0][x, y].flatten(),
+            "Window": y,
+            "Masking": x,
+        }) for y in range(20) for x in range(20)
+    ])
+    return (alt.Chart(LS_data).mark_rect().properties(
+        height=250, width=250).encode(
+            alt.X("Window:O"),
+            alt.Y("Masking:O"),
+            alt.Color("Subsequent Mask:Q", scale=alt.Scale(scheme="viridis")),
+        ).interactive())
+
+
+def attention(query, key, value, mask=None, dropout=None):
+    """
+    attention 计算缩放点积注意力机制
+    """
+    # 返回query最后一个轴的长度
+    d_k = query.size(-1)
+    # key.transpose(-2, -1) 将key的倒数第二个轴和倒数第一个轴交换 转置操作
+    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
+    # 如果存在mask，将mask的值为0的位置替换为-1e9
+    if mask is not None:
+        scores = scores.masked_fill(mask == 0, -1e9)
+    # 按照最后一个轴计算softmax，即对每个query计算softmax
+    p_attn = scores.softmax(dim=-1)
+    # dropout存在，则进行dropout
+    if dropout is not None:
+        p_attn = dropout(p_attn)
+    # 返回注意力权重和value的乘积 和 注意力权重
+    return torch.matmul(p_attn, value), p_attn
+
+
+if __name__ == "__main__":
+    show_example(example_mask)
