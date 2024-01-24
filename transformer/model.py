@@ -121,17 +121,23 @@ class Encoder(nn.Module):
         return self.norm(x)
 
 
+# 层归一化
 class LayerNorm(nn.Module):
 
     def __init__(self, features, eps=1e-6):
         super().__init__()
+
         self.a_2 = nn.Parameter(torch.ones(features))
         self.b_2 = nn.Parameter(torch.zeros(features))
+        # 防止在计算标准差时出现 ÷ 0 的错误
         self.eps = eps
 
     def forward(self, x):
+        # 计算 x 的均值，保持维度不变
         mean = x.mean(-1, keepdim=True)
+        # 计算 x 的标准差，保持维度不变
         std = x.std(-1, keepdim=True)
+        #
         return self.a_2 * (x - mean) / (std + self.eps) + self.b_2
 
 
@@ -262,5 +268,151 @@ def attention(query, key, value, mask=None, dropout=None):
     return torch.matmul(p_attn, value), p_attn
 
 
-if __name__ == "__main__":
-    show_example(example_mask)
+class MultiHeadedAttention(nn.Module):
+
+    def __init__(self, h, d_model, dropout=0.1):
+        """
+        接收多个头的个数和维度进行初始化
+        
+        Args
+            h 头的个数
+            d_model 模型维度
+            dropout dropout概率
+        """
+        super().__init__()
+
+        # 确保 d_model 可以被 h 整除
+        assert d_model % h == 0
+
+        self.d_k = d_model
+        self.h = h
+
+        # 四个线性层的列表
+        self.linears = clones(nn.Linear(d_model, d_model), 4)
+
+        # 存储注意力权重
+        self.attn = None
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, query, key, value, mask=None):
+        # 将掩码 mask 扩展为一个四维向量，使其形状和注意力权重张量相匹配
+        if mask is not None:
+            # mask(batch_size, seq_len) ==> (batch_size, 1, seq_len)
+            mask = mask.unsqueeze(1)
+        # 获取 query 张量中第一个维度的大小
+        nbatches = query.size(0)
+        # 1. 批量计算线性投影从 d_model => h * d_k
+        query, key, value = [
+            # 2. lin 是 self.linears 列表中的一个线性层
+            # 3. x 是 (q, k, v) 元组中的一个元素
+            # 1. lin(x) 对 x 进行线性变换，将变换后的结果重新排列 ==> (nbatches, -1, self.h, self.d_k)
+            # self.d_k 头的维度
+            # 这里用了三个线性层，分别对应 q, k, v
+            lin(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
+            for lin, x in zip(self.linears, (query, key, value))
+        ]
+
+        # 2. 计算 attention
+        x, self.attn = attention(query,
+                                 key,
+                                 value,
+                                 mask=mask,
+                                 dropout=self.dropout)
+
+        # 3. 将多头的结果连接起来
+        # 将 x 的第二个和第三个维度交换，转换为连续的内存布局，重新排列为 ==> (nbatches, -1, self.h * self.d_k)
+        x = x.transpose(1, 2).contiguous().view(nbatches, -1,
+                                                self.h * self.d_k)
+
+        del query
+        del key
+        del value
+
+        # 最后一个线性层
+        return self.linears[-1](x)
+
+
+# 基于位置的前馈网络 == 全连接神经网络
+class PositionwiseFeedForward(nn.Module):
+    """
+    PositionwiseFeedForward 实现一个FFN模型
+    """
+
+    def __init__(self, d_model, d_ff, dropout=0.1):
+        super().__init__()
+        # 两个线性层
+        self.w_1 = nn.Linear(d_model, d_ff)
+        # 第二个线性层将输出映射回d_model维度
+        self.w_2 = nn.Linear(d_ff, d_model)
+        # dropout
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.w_2(self.dropout(self.w_1(x).relu()))
+
+
+class Embeddings(nn.Module):
+
+    def __init__(self, d_model, vocab):
+        super().__init__()
+        self.lut = nn.Embedding(vocab, d_model)
+        self.d_model = d_model
+
+    def forward(self, x):
+        return self.lut(x) * math.sqrt(self.d_model)
+
+
+class PositionalEncoding(nn.Module):
+    """
+    PositionalEncoding 实现位置编码 PE
+    """
+
+    def __init__(self, d_model, dropout, max_len=5000):
+        super().__init__()
+        # 计算位置编码
+        self.dropout = nn.Dropout(p=dropout)
+
+        # 在对数空间中计算位置编码
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model))
+
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1)].requires_grad_(False)
+        return self.dropout(x)
+
+
+def make_model(src_vocab,
+               tgt_vocab,
+               N=6,
+               d_model=512,
+               d_ff=2048,
+               h=8,
+               dropout=0.1):
+    """
+     _summary_ 从超参数中构建一个模型
+    """
+    c = copy.deepcopy
+    attn = MultiHeadedAttention(h, d_model)
+    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+    position = PositionalEncoding(d_model, dropout)
+    # 模型
+    model = EncoderDecoder(
+        Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
+        Decoder(DecoderLayer(d_model, c(attn), c(attn), c(ff), dropout), N),
+        nn.Sequential(Embeddings(d_model, src_vocab), c(position)),
+        nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
+        Generator(d_model, tgt_vocab))
+
+    for p in model.parameters():
+        if p.dim() > 1:
+            nn.init.xavier_uniform_(p)
+
+    return model
