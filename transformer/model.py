@@ -416,3 +416,28 @@ def make_model(src_vocab,
             nn.init.xavier_uniform_(p)
 
     return model
+
+
+class Batch:
+    """
+    训练期间用于保存一批带掩码的数据的图像
+    """
+
+    def __init__(self, src, tgt=None, pad=2):
+        self.src = src
+        # unsqueeze 在最后一个维度 增加一个维度
+        self.src_mask = (src != pad).unsqueeze(-2)
+        if tgt is not None:
+            self.tgt = tgt[:, :-1]
+            self.tgt_y = tgt[:, 1:]
+            self.tgt_mask = self.make_std_mask(self.tgt, pad)
+            self.ntokens = (self.tgt_y != pad).data.sum()
+
+    @staticmethod
+    def make_std_mask(tgt, pad):
+        # 创建一个掩码来隐藏并填充未来的word
+        tgt_mask = (tgt != pad).unsqueeze(-2)
+        tgt_mask = tgt_mask & subsequent_mask(tgt.size(-1)).type_as(
+            tgt_mask.data)
+
+        return tgt_mask
